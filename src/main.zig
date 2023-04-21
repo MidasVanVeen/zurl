@@ -1,6 +1,9 @@
 const std = @import("std");
 
+const Scheme = enum {http, https};
+
 const Configuration = struct {
+    scheme: Scheme,
     host: []const u8,
     port: u16,
     remote_path: []const u8,
@@ -16,6 +19,7 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
     _ = args_it.skip();
     var index: u32 = 1;
 
+    var scheme = Scheme.http;
     var host: []const u8 = undefined;
     var port: u16 = 80;
     var remote_path: []const u8 = "/";
@@ -32,15 +36,12 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
             remote_path = args[index+1];
         }
         if (std.mem.eql(u8, arg, "-u")) {
-            var split = std.mem.split(u8, args[index+1], "://");
-            const proto = split.first();
-            if (proto[0] != 0) {
-                if (std.mem.eql(u8, proto, "http")) {
-                    port = 80;
-                }
-                var hostsplit = std.mem.split(u8, split.rest(), "/");
-                host = hostsplit.first();
-                remote_path = try std.fmt.allocPrint(allocator, "/{s}", .{hostsplit.rest()});
+            const uri = try std.Uri.parse(args[index+1]);
+            host = uri.host;
+            port = uri.port;
+            remote_path = uri.path;
+            if (std.mem.eql(u8, uri.scheme, "https")) {
+                scheme = Scheme.https;
             }
         }
         if (std.mem.eql(u8, arg, "-H")) {
@@ -68,6 +69,7 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
     }
 
     return Configuration{
+        .scheme=scheme,
         .host=host,
         .port=80,
         .remote_path=remote_path,
@@ -85,51 +87,55 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
 /// @param outfile: file descriptor to write the response to.
 ///
 /// @returns usize, the amount of bytes recieved.
-pub fn request(allocator: std.mem.Allocator, host: []const u8, port: u16, remote_path: []const u8, headers: std.StringArrayHashMap([]const u8), outfile: std.fs.File) !usize {
-    var requestBuffer: [1024]u8 = undefined;
-    {
-        var stream = std.io.fixedBufferStream(&requestBuffer);
-        var writer = stream.writer();
-        try std.fmt.format(writer, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n", .{remote_path, host});
+pub fn request(allocator: std.mem.Allocator, scheme: Scheme, host: []const u8, port: u16, remote_path: []const u8, headers: std.StringArrayHashMap([]const u8), outfile: std.fs.File) !usize {
+    if (scheme == Scheme.http) {
+        var requestBuffer: [1024]u8 = undefined;
+        {
+            var stream = std.io.fixedBufferStream(&requestBuffer);
+            var writer = stream.writer();
+            try std.fmt.format(writer, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n", .{remote_path, host});
 
-        // write all the headers to the requestBuffer
-        var it = headers.iterator();
-        while (it.next()) |pair| {
-            try std.fmt.format(writer, "{s}: {s}\r\n", .{pair.key_ptr.*, pair.value_ptr.*});
+            // write all the headers to the requestBuffer
+            var it = headers.iterator();
+            while (it.next()) |pair| {
+                try std.fmt.format(writer, "{s}: {s}\r\n", .{pair.key_ptr.*, pair.value_ptr.*});
+            }
+
+            // add the extra \r\n at the end
+            try std.fmt.format(writer, "\r\n", .{});
         }
 
-        // add the extra \r\n at the end
-        try std.fmt.format(writer, "\r\n", .{});
+        var conn = try std.net.tcpConnectToHost(allocator, host, port);
+        defer conn.close();
+
+        // make the request
+        _ = try conn.write(&requestBuffer);
+
+        // create a buffered writer of the outfile
+        var bw = std.io.bufferedWriter(outfile.writer());
+        var writer = bw.writer();
+
+        var total_bytes: usize = 0;
+        var buf: [1024]u8 = undefined;
+
+        // loops while the tcp connection is recieving data
+        while (true) {
+            const byte_count = try conn.read(&buf);
+            if (byte_count == 0) break;
+
+            _ = try writer.write(&buf);
+            total_bytes += byte_count;
+        }
+        try bw.flush();
+        return total_bytes;
+    } else {
+        return 0;
     }
-
-    var conn = try std.net.tcpConnectToHost(allocator, host, port);
-    defer conn.close();
-
-    // make the request
-    _ = try conn.write(&requestBuffer);
-
-    // create a buffered writer of the outfile
-    var bw = std.io.bufferedWriter(outfile.writer());
-    var writer = bw.writer();
-
-    var total_bytes: usize = 0;
-    var buf: [1024]u8 = undefined;
-
-    // loops while the tcp connection is recieving data
-    while (true) {
-        const byte_count = try conn.read(&buf);
-        if (byte_count == 0) break;
-
-        _ = try writer.write(&buf);
-        total_bytes += byte_count;
-    }
-    try bw.flush();
-    return total_bytes;
 }
 
 /// Wrapper for request that accepts a Configuration struct
 pub fn requestWithConfiguration(allocator: std.mem.Allocator, config: Configuration) !usize {
-    return try request(allocator, config.host, config.port, config.remote_path, config.headers, config.outfile);
+    return try request(allocator, config.scheme, config.host, config.port, config.remote_path, config.headers, config.outfile);
 }
 
 pub fn main() anyerror!void {

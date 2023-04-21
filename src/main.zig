@@ -44,7 +44,7 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
             }
         }
         if (std.mem.eql(u8, arg, "-H")) {
-            var split = std.mem.split(u8, args[index+1], "','"); // splits on "|"
+            var split = std.mem.split(u8, args[index+1], "','");
             var first = split.first();
             var last: []const u8 = undefined;
             while (split.next()) |p| {
@@ -60,7 +60,7 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
                 } else {
                     strippedpair = pair;
                 }
-                var pairsplit = std.mem.split(u8, strippedpair, "':'"); // splits on ":"
+                var pairsplit = std.mem.split(u8, strippedpair, "':'");
                 try headers.put(pairsplit.first(), pairsplit.rest());
             }
         }

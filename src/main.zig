@@ -37,11 +37,12 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
         }
         if (std.mem.eql(u8, arg, "-u")) {
             const uri = try std.Uri.parse(args[index+1]);
-            host = uri.host;
-            port = uri.port;
+            host = uri.host.?;
+            port = uri.port orelse 80;
             remote_path = uri.path;
             if (std.mem.eql(u8, uri.scheme, "https")) {
                 scheme = Scheme.https;
+                port = uri.port orelse 443;
             }
         }
         if (std.mem.eql(u8, arg, "-H")) {
@@ -53,13 +54,12 @@ fn parseArguments(allocator: std.mem.Allocator) !Configuration {
             }
             split.index = 0;
             while (split.next()) |pair| {
-                var strippedpair: []const u8 = undefined;
+                var strippedpair = pair;
                 if (std.mem.eql(u8, pair, first)) {
-                    strippedpair = pair[1..];
-                } else if (std.mem.eql(u8, pair, last)) {
-                    strippedpair = pair[0..pair.len-1];
-                } else {
-                    strippedpair = pair;
+                    strippedpair = strippedpair[1..];
+                }
+                if (std.mem.eql(u8, pair, last)) {
+                    strippedpair = strippedpair[0..pair.len-1];
                 }
                 var pairsplit = std.mem.split(u8, strippedpair, "':'");
                 try headers.put(pairsplit.first(), pairsplit.rest());

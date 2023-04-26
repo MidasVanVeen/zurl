@@ -1,148 +1,91 @@
 const std = @import("std");
+const parseArgs = @import("argparse.zig").parseArgs;
 
-const Scheme = enum {http, https};
+const Args = struct {
+    url: []const u8,
+    headers: ?[]const u8,
+    proxy: ?[]const u8,
+    method: ?[]const u8,
+};
 
 const Configuration = struct {
-    scheme: Scheme,
+    url: std.Uri,
     host: []const u8,
     port: u16,
-    remote_path: []const u8,
-    headers: std.StringArrayHashMap([]const u8),
-    outfile: std.fs.File,
+    // headers are initialized by parsing json passed as a command-line parameter.
+    headers: ?std.http.Headers,
+    proxy: ?std.http.Client.HttpProxy,
+    method: ?std.http.Method,
+    protocol: std.http.Client.Connection.Protocol,
 };
 
 /// Parses command-line arguments as a Configuration struct
-fn parseArguments(allocator: std.mem.Allocator) !Configuration {
-    var args = try std.process.argsAlloc(allocator);
-    var args_it = try std.process.argsWithAllocator(allocator);
-
-    _ = args_it.skip();
-    var index: u32 = 1;
-
-    var scheme = Scheme.http;
-    var host: []const u8 = undefined;
-    var port: u16 = 80;
-    var remote_path: []const u8 = "/";
-    var headers = std.StringArrayHashMap([]const u8).init(allocator);
-    var outfile = std.io.getStdOut();
-    while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h")) {
-            host = args[index+1];
-        }
-        if (std.mem.eql(u8, arg, "-p")) {
-            port = try std.fmt.parseUnsigned(u16, args[index+1], 10);
-        }
-        if (std.mem.eql(u8, arg, "--remote-path")) {
-            remote_path = args[index+1];
-        }
-        if (std.mem.eql(u8, arg, "-u")) {
-            const uri = try std.Uri.parse(args[index+1]);
-            host = uri.host.?;
-            port = uri.port orelse 80;
-            remote_path = uri.path;
-            if (std.mem.eql(u8, uri.scheme, "https")) {
-                scheme = Scheme.https;
-                port = uri.port orelse 443;
-            }
-        }
-        if (std.mem.eql(u8, arg, "-H")) {
-            var split = std.mem.split(u8, args[index+1], "','");
-            var first = split.first();
-            var last: []const u8 = undefined;
-            while (split.next()) |p| {
-                last = p;
-            }
-            split.index = 0;
-            while (split.next()) |pair| {
-                var strippedpair = pair;
-                if (std.mem.eql(u8, pair, first)) {
-                    strippedpair = strippedpair[1..];
-                }
-                if (std.mem.eql(u8, pair, last)) {
-                    strippedpair = strippedpair[0..pair.len-1];
-                }
-                var pairsplit = std.mem.split(u8, strippedpair, "':'");
-                try headers.put(pairsplit.first(), pairsplit.rest());
-            }
-        }
-        index += 1;
-    }
-
-    return Configuration{
-        .scheme=scheme,
-        .host=host,
-        .port=80,
-        .remote_path=remote_path,
-        .headers=headers,
-        .outfile=outfile,
+fn argsToConfiguration(allocator: std.mem.Allocator, args: Args) !Configuration {
+    var url = try std.Uri.parse(args.url);
+    var config: Configuration = .{
+        .url=url,
+        .host = url.host.?,
+        .port = url.port orelse 80,
+        .headers = null,
+        .proxy = null,
+        .method = null,
+        .protocol = .plain,
     };
-}
 
-/// Method for sending a request and writing the output to a file, for example, stdout.
-///
-/// @param host: the host to send the request to, can be an ip or a hostname.
-/// @param port: the port used for the tcp connection.
-/// @param remote_path: the path used by the http request.
-/// @param headers: a StringArrayHashMap containing the header pairs.
-/// @param outfile: file descriptor to write the response to.
-///
-/// @returns usize, the amount of bytes recieved.
-pub fn request(allocator: std.mem.Allocator, scheme: Scheme, host: []const u8, port: u16, remote_path: []const u8, headers: std.StringArrayHashMap([]const u8), outfile: std.fs.File) !usize {
-    if (scheme == Scheme.http) {
-        var requestBuffer: [1024]u8 = undefined;
-        {
-            var stream = std.io.fixedBufferStream(&requestBuffer);
-            var writer = stream.writer();
-            try std.fmt.format(writer, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n", .{remote_path, host});
-
-            // write all the headers to the requestBuffer
-            var it = headers.iterator();
-            while (it.next()) |pair| {
-                try std.fmt.format(writer, "{s}: {s}\r\n", .{pair.key_ptr.*, pair.value_ptr.*});
-            }
-
-            // add the extra \r\n at the end
-            try std.fmt.format(writer, "\r\n", .{});
-        }
-
-        var conn = try std.net.tcpConnectToHost(allocator, host, port);
-        defer conn.close();
-
-        // make the request
-        _ = try conn.write(&requestBuffer);
-
-        // create a buffered writer of the outfile
-        var bw = std.io.bufferedWriter(outfile.writer());
-        var writer = bw.writer();
-
-        var total_bytes: usize = 0;
-        var buf: [1024]u8 = undefined;
-
-        // loops while the tcp connection is recieving data
-        while (true) {
-            const byte_count = try conn.read(&buf);
-            if (byte_count == 0) break;
-
-            _ = try writer.write(&buf);
-            total_bytes += byte_count;
-        }
-        try bw.flush();
-        return total_bytes;
-    } else {
-        return 0;
+    if (std.mem.eql(u8, config.url.scheme, "https")) {
+        config.port = 443;
+        config.protocol = .tls;
     }
+
+    if (args.headers) |_headers| {
+        config.headers = std.http.Headers.init(allocator);
+        var parser = std.json.Parser.init(allocator, false);
+        defer parser.deinit();
+        var tree = try parser.parse(_headers);
+        var it = tree.root.Object.iterator();
+        while (it.next()) |pair| {
+            try config.headers.?.append(pair.key_ptr.*, pair.value_ptr.*.String);
+        }
+    }
+
+    if (args.proxy) |_proxy| {
+        config.proxy = std.http.Client.HttpProxy{.host="",.protocol=.plain};
+        var proxyuri = try std.Uri.parse(_proxy);
+        if (std.mem.eql(u8, proxyuri.scheme, "https")) {
+            config.proxy.?.protocol = .tls;
+        }
+        config.proxy.?.host = proxyuri.host.?;
+        config.proxy.?.port = proxyuri.port.?;
+    }
+
+    if (args.method) |_proxy| {
+        if (std.mem.eql(u8, _proxy, "POST")) {
+            config.method = std.http.Method.POST;
+        }
+    }
+
+    return config;
 }
 
-/// Wrapper for request that accepts a Configuration struct
-pub fn requestWithConfiguration(allocator: std.mem.Allocator, config: Configuration) !usize {
-    return try request(allocator, config.scheme, config.host, config.port, config.remote_path, config.headers, config.outfile);
+pub fn request(allocator: std.mem.Allocator, config: Configuration) ![]const u8 {
+    var client: std.http.Client = .{ .allocator = allocator, .proxy = config.proxy};
+    defer client.deinit();
+    if (config.protocol == .tls) {
+        // Code for ssl request.
+        var connection = try client.connectUnproxied(config.host, config.port, config.protocol);
+        var req = try client.request(config.method.?, config.url, config.headers.?, .{ .connection = connection });
+        defer req.deinit();
+        std.debug.print("{s}\n", req.response.reason);
+    }
+    return "";
 }
 
 pub fn main() anyerror!void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    const config = try parseArguments(arena.allocator());
-    const bytes = try requestWithConfiguration(arena.allocator(), config);
+    const args = try parseArgs(Args);
+    const config = try argsToConfiguration(arena.allocator(), args);
+    const bytes = try request(arena.allocator(), config);
     std.debug.print("{d} bytes recieved.\n", .{bytes});
 }
